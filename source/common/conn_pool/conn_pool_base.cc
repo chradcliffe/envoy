@@ -268,6 +268,7 @@ void ConnPoolImplBase::closeIdleConnections() {
 }
 
 void ConnPoolImplBase::drainConnectionsImpl() {
+  drain_connections_called_ = true;
   closeIdleConnections();
 
   // closeIdleConnections() closes all connections in ready_clients_ with no active streams,
@@ -289,6 +290,8 @@ void ConnPoolImplBase::checkForDrained() {
   if (drained_callbacks_.empty()) {
     return;
   }
+
+  ASSERT(drain_connections_called_);
 
   closeIdleConnections();
 

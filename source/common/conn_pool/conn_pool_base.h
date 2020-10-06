@@ -223,6 +223,8 @@ protected:
   // The number of streams that can be immediately dispatched
   // if all CONNECTING connections become connected.
   uint64_t connecting_stream_capacity_{0};
+
+  bool drain_connections_called_{false};
 };
 
 } // namespace ConnectionPool
