@@ -82,6 +82,32 @@ BENCHMARK(benchmarkDnsCacheInsertion)
     ->Complexity(::benchmark::oN)
     ->Unit(::benchmark::kMillisecond);
 
+void benchmarkFlatHashMapCopy(::benchmark::State& state) {
+  const uint64_t initial_items = state.range(0);
+
+  for (auto _ : state) {
+    state.PauseTiming();
+    absl::flat_hash_map<std::string, std::shared_ptr<int>> test_map;
+
+    for (uint64_t i = 0; i < initial_items; ++i) {
+      std::string hostname = fmt::format("{}.com", i);
+      test_map.try_emplace("foo-" + hostname, std::make_shared<int>(i));
+    }
+
+    state.ResumeTiming();
+    absl::flat_hash_map<std::string, std::shared_ptr<int>> my_other_map{test_map};
+    ::benchmark::DoNotOptimize(test_map.empty());
+
+    state.SetComplexityN(initial_items);
+  }
+}
+
+BENCHMARK(benchmarkFlatHashMapCopy)
+    ->RangeMultiplier(10)
+    ->Range(10, 10000000)
+    ->Complexity(::benchmark::oN)
+    ->Unit(::benchmark::kMillisecond);
+
 } // namespace
 } // namespace DynamicForwardProxy
 } // namespace Common
