@@ -14,6 +14,10 @@
 #include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
+#include "absl/container/btree_map.h"
+
+#include <unordered_map>
+
 #include "benchmark/benchmark.h"
 
 namespace Envoy {
@@ -28,7 +32,7 @@ struct DnsCacheTester {
   void initialize(uint64_t num_hosts) {
     config_.set_name("foo");
     config_.set_dns_lookup_family(envoy::config::cluster::v3::Cluster::V4_ONLY);
-    config_.mutable_max_hosts()->set_value(num_hosts);
+    config_.mutable_max_hosts()->set_value(num_hosts + 1);
     EXPECT_CALL(dispatcher_, createDnsResolver(_, _)).WillOnce(Return(resolver_));
     dns_cache_ =
         std::make_unique<DnsCacheImpl>(dispatcher_, tls_, random_, loader_, store_, config_);
@@ -79,33 +83,68 @@ void benchmarkDnsCacheInsertion(::benchmark::State& state) {
 BENCHMARK(benchmarkDnsCacheInsertion)
     ->RangeMultiplier(10)
     ->Range(10, 10000)
-    ->Complexity(::benchmark::oN)
+    ->MinTime(2)
+    ->Complexity(::benchmark::oAuto)
     ->Unit(::benchmark::kMillisecond);
 
+template <typename ValueType> ValueType create(int value);
+
+template <> std::shared_ptr<int> create<std::shared_ptr<int>>(int value) {
+  return std::make_shared<int>(value);
+}
+
+template <> int* create<int*>(int value) { return new int{value}; }
+
+template <typename Container, typename ValueType>
 void benchmarkFlatHashMapCopy(::benchmark::State& state) {
   const uint64_t initial_items = state.range(0);
 
   for (auto _ : state) {
     state.PauseTiming();
-    absl::flat_hash_map<std::string, std::shared_ptr<int>> test_map;
+    Container test_map;
 
     for (uint64_t i = 0; i < initial_items; ++i) {
       std::string hostname = fmt::format("{}.com", i);
-      test_map.try_emplace("foo-" + hostname, std::make_shared<int>(i));
+      test_map.try_emplace(hostname, create<ValueType>(i));
     }
 
     state.ResumeTiming();
-    absl::flat_hash_map<std::string, std::shared_ptr<int>> my_other_map{test_map};
+    Container my_other_map{test_map};
     ::benchmark::DoNotOptimize(test_map.empty());
 
     state.SetComplexityN(initial_items);
   }
 }
 
-BENCHMARK(benchmarkFlatHashMapCopy)
+BENCHMARK_TEMPLATE(benchmarkFlatHashMapCopy, absl::flat_hash_map<std::string, std::shared_ptr<int>>,
+                   std::shared_ptr<int>)
     ->RangeMultiplier(10)
     ->Range(10, 10000000)
-    ->Complexity(::benchmark::oN)
+    ->MinTime(1)
+    ->Complexity(::benchmark::oAuto)
+    ->Unit(::benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(benchmarkFlatHashMapCopy, absl::flat_hash_map<std::string, int*>, int*)
+    ->RangeMultiplier(10)
+    ->Range(10, 10000000)
+    ->MinTime(1)
+    ->Complexity(::benchmark::oAuto)
+    ->Unit(::benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(benchmarkFlatHashMapCopy, absl::btree_map<std::string, std::shared_ptr<int>>,
+                   std::shared_ptr<int>)
+    ->RangeMultiplier(10)
+    ->Range(10, 10000000)
+    ->MinTime(1)
+    ->Complexity(::benchmark::oAuto)
+    ->Unit(::benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(benchmarkFlatHashMapCopy, std::unordered_map<std::string, std::shared_ptr<int>>,
+                   std::shared_ptr<int>)
+    ->RangeMultiplier(10)
+    ->Range(10, 10000000)
+    ->MinTime(1)
+    ->Complexity(::benchmark::oAuto)
     ->Unit(::benchmark::kMillisecond);
 
 } // namespace
