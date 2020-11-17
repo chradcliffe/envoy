@@ -31,7 +31,7 @@ DnsCacheImpl::DnsCacheImpl(
               config, refresh_interval_.count(), random)),
       host_ttl_(PROTOBUF_GET_MS_OR_DEFAULT(config, host_ttl, 300000)),
       max_hosts_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, max_hosts, 1024)) {
-  tls_slot_.set([](Event::Dispatcher&) { return std::make_shared<ThreadLocalHostInfo>(); });
+  tls_slot_.set([&](Event::Dispatcher&) { return std::make_shared<ThreadLocalHostInfo>(*this); });
   updateTlsHostsMap();
 }
 
@@ -56,11 +56,20 @@ DnsCacheImpl::loadDnsCacheEntry(absl::string_view host, uint16_t default_port,
                                 LoadDnsCacheEntryCallbacks& callbacks) {
   ENVOY_LOG(debug, "thread local lookup for host '{}'", host);
   ThreadLocalHostInfo& tls_host_info = *tls_slot_;
-  auto tls_host = tls_host_info.host_map_->find(host);
-  if (tls_host != tls_host_info.host_map_->end()) {
+
+  auto [cache_hit, is_overflow] = [&]() {
+    // TODO: Consider returning the looked-up host
+    absl::ReaderMutexLock read_lock{&primary_hosts_lock_};
+    auto tls_host = primary_hosts_->find(host);
+    bool cache_hit = tls_host != primary_hosts_->end();
+    bool is_overflow = primary_hosts_->size() >= max_hosts_;
+    return std::make_tuple(cache_hit, is_overflow);
+  }();
+
+  if (cache_hit) {
     ENVOY_LOG(debug, "thread local hit for host '{}'", host);
     return {LoadDnsCacheEntryStatus::InCache, nullptr};
-  } else if (tls_host_info.host_map_->size() >= max_hosts_) {
+  } else if (is_overflow) {
     // Given that we do this check in thread local context, it's possible for two threads to race
     // and potentially go slightly above the configured max hosts. This is an OK given compromise
     // given how much simpler the implementation is.
@@ -91,8 +100,9 @@ DnsCacheImpl::canCreateDnsRequest(ResourceLimitOptRef pending_requests) {
   return std::make_unique<Upstream::ResourceAutoIncDec>(current_pending_requests);
 }
 
-absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> DnsCacheImpl::hosts() {
+absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> DnsCacheImpl::hostMapCopy() {
   absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> ret;
+  absl::ReaderMutexLock reader_lock{&primary_hosts_lock_};
   for (const auto& host : primary_hosts_) {
     // Only include hosts that have ever resolved to an address.
     if (host.second->host_info_->address_ != nullptr) {
@@ -104,21 +114,19 @@ absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> DnsCacheImpl::hosts() {
 
 absl::optional<const DnsHostInfoSharedPtr> DnsCacheImpl::getHost(absl::string_view host_name) {
   // Find a host with the given name.
-  auto it = primary_hosts_.find(host_name);
-  if (it == primary_hosts_.end()) {
-    return {};
-  }
-
-  // Extract host info.
-  auto&& host_info = it->second->host_info_;
+  const auto host_info = [&]() -> const DnsHostInfoSharedPtr {
+    absl::ReaderMutexLock reader_lock{&primary_hosts_lock_};
+    auto it = primary_hosts_.find(host_name);
+    return it != primary_hosts_.end() ? it->second->host_info : nullptr;
+  }();
 
   // Only include hosts that have ever resolved to an address.
-  if (host_info->address_ == nullptr) {
+  if (!host_info || host_info->address_ == nullptr) {
     return {};
+  } else {
+    // Return host info.
+    return host_info;
   }
-
-  // Return host info.
-  return host_info;
 }
 
 DnsCacheImpl::AddUpdateCallbacksHandlePtr
@@ -130,8 +138,12 @@ void DnsCacheImpl::startCacheLoad(const std::string& host, uint16_t default_port
   // It's possible for multiple requests to race trying to start a resolution. If a host is
   // already in the map it's either in the process of being resolved or the resolution is already
   // heading out to the worker threads. Either way the pending resolution will be completed.
-  const auto primary_host_it = primary_hosts_.find(host);
-  if (primary_host_it != primary_hosts_.end()) {
+  bool in_map = [&]() {
+    absl::ReaderMutexLock reader_lock{&primary_hosts_lock_};
+    return primary_hosts_.find(host) != primary_hosts_.end();
+  }();
+
+  if (in_map) {
     ENVOY_LOG(debug, "main thread resolve for host '{}' skipped. Entry present", host);
     return;
   }
@@ -141,6 +153,7 @@ void DnsCacheImpl::startCacheLoad(const std::string& host, uint16_t default_port
   // TODO(mattklein123): Right now, the same host with different ports will become two
   // independent primary hosts with independent DNS resolutions. I'm not sure how much this will
   // matter, but we could consider collapsing these down and sharing the underlying DNS resolution.
+  absl::WriterMutexLock writer_lock{&primary_hosts_lock_};
   auto& primary_host = *primary_hosts_
                             // try_emplace() is used here for direct argument forwarding.
                             .try_emplace(host, std::make_unique<PrimaryHostInfo>(
@@ -177,6 +190,7 @@ void DnsCacheImpl::onReResolve(const std::string& host) {
 }
 
 void DnsCacheImpl::startResolve(const std::string& host, PrimaryHostInfo& host_info) {
+  absl::ReaderMutexLock reader_lock{host_info.lock_};
   ENVOY_LOG(debug, "starting main thread resolve for host='{}' dns='{}' port='{}'", host,
             host_info.host_info_->resolved_host_, host_info.port_);
   ASSERT(host_info.active_query_ == nullptr);
@@ -266,17 +280,9 @@ void DnsCacheImpl::runRemoveCallbacks(const std::string& host) {
   }
 }
 
-void DnsCacheImpl::updateTlsHostsMap() {
-  TlsHostMapSharedPtr new_host_map = std::make_shared<TlsHostMap>();
-  for (const auto& primary_host : primary_hosts_) {
-    // Do not include hosts that have not resolved at least once.
-    if (primary_host.second->host_info_->first_resolve_complete_) {
-      new_host_map->emplace(primary_host.first, primary_host.second->host_info_);
-    }
-  }
-
+void DnsCacheImpl::notifyThreads() {
   tls_slot_.runOnAllThreads([new_host_map](OptRef<ThreadLocalHostInfo> local_host_info) {
-    local_host_info->updateHostMap(new_host_map);
+    local_host_info->onHostMapUpdate();
   });
 }
 
@@ -287,12 +293,16 @@ DnsCacheImpl::ThreadLocalHostInfo::~ThreadLocalHostInfo() {
   }
 }
 
-void DnsCacheImpl::ThreadLocalHostInfo::updateHostMap(const TlsHostMapSharedPtr& new_host_map) {
+void DnsCacheImpl::ThreadLocalHostInfo::onHostMapUpdate() {
   host_map_ = new_host_map;
   for (auto pending_resolution_it = pending_resolutions_.begin();
        pending_resolution_it != pending_resolutions_.end();) {
     auto& pending_resolution = **pending_resolution_it;
-    if (host_map_->count(pending_resolution.host_) != 0) {
+    bool has_host = [&]() {
+      absl::ReaderMutexLock reader_lock{&parent_.primary_hosts_lock_};
+      return parent_.primary_hosts_->count(pending_resolution.host_) != 0;
+    }();
+    if (has_host) {
       auto& callbacks = pending_resolution.callbacks_;
       pending_resolution.cancel();
       pending_resolution_it = pending_resolutions_.erase(pending_resolution_it);

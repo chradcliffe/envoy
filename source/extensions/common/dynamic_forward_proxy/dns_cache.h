@@ -175,7 +175,7 @@ public:
   /**
    * @return all hosts currently stored in the cache.
    */
-  virtual absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> hosts() PURE;
+  virtual absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> hostMapCopy() PURE;
 
   /**
    * Retrieve the DNS host info of a given host currently stored in the cache.

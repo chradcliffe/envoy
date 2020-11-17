@@ -51,7 +51,7 @@ public:
   LoadDnsCacheEntryResult loadDnsCacheEntry(absl::string_view host, uint16_t default_port,
                                             LoadDnsCacheEntryCallbacks& callbacks) override;
   AddUpdateCallbacksHandlePtr addUpdateCallbacks(UpdateCallbacks& callbacks) override;
-  absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> hosts() override;
+  absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> hostMapCopy() override;
   absl::optional<const DnsHostInfoSharedPtr> getHost(absl::string_view host_name) override;
   Upstream::ResourceAutoIncDecPtr
   canCreateDnsRequest(ResourceLimitOptRef pending_requests) override;
@@ -73,11 +73,10 @@ private:
 
   // Per-thread DNS cache info including the currently known hosts as well as any pending callbacks.
   struct ThreadLocalHostInfo : public ThreadLocal::ThreadLocalObject {
+    ThreadLocalHostInfo(DnsCacheImpl& parent) : parent_{parent} {}
     ~ThreadLocalHostInfo() override;
-    void updateHostMap(const TlsHostMapSharedPtr& new_host_map);
-
-    TlsHostMapSharedPtr host_map_;
     std::list<LoadDnsCacheEntryHandleImpl*> pending_resolutions_;
+    DnsCacheImpl& parent_;
   };
 
   struct DnsHostInfoImpl : public DnsHostInfo {
@@ -92,14 +91,13 @@ private:
     bool isIpAddress() const override { return is_ip_address_; }
     void touch() final { last_used_time_ = time_source_.monotonicTime().time_since_epoch(); }
 
+    absl::Mutex lock_;
     TimeSource& time_source_;
     const std::string resolved_host_;
     const bool is_ip_address_;
-    bool first_resolve_complete_{};
-    Network::Address::InstanceConstSharedPtr address_;
-    // Using std::chrono::steady_clock::duration is required for compilation within an atomic vs.
-    // using MonotonicTime.
-    std::atomic<std::chrono::steady_clock::duration> last_used_time_;
+    bool first_resolve_complete_ ABSL_GUARDED_BY(lock_){};
+    Network::Address::InstanceConstSharedPtr address_ ABSL_GUARDED_BY(lock_);
+    MonotonicTime last_used_time_ ABSL_GUARDED_BY(lock_);
   };
 
   using DnsHostInfoImplSharedPtr = std::shared_ptr<DnsHostInfoImpl>;
@@ -134,7 +132,7 @@ private:
                      std::list<Network::DnsResponse>&& response);
   void runAddUpdateCallbacks(const std::string& host, const DnsHostInfoSharedPtr& host_info);
   void runRemoveCallbacks(const std::string& host);
-  void updateTlsHostsMap();
+  void notifyThreads();
   void onReResolve(const std::string& host);
 
   Event::Dispatcher& main_thread_dispatcher_;
@@ -144,7 +142,9 @@ private:
   Stats::ScopePtr scope_;
   DnsCacheStats stats_;
   std::list<AddUpdateCallbacksHandleImpl*> update_callbacks_;
-  absl::flat_hash_map<std::string, PrimaryHostInfoPtr> primary_hosts_;
+  absl::Mutex primary_hosts_lock_;
+  absl::flat_hash_map<std::string, PrimaryHostInfoPtr>
+      primary_hosts_ ABSL_GUARDED_BY(primary_hosts_lock_);
   DnsCacheResourceManagerImpl resource_manager_;
   const std::chrono::milliseconds refresh_interval_;
   const BackOffStrategyPtr failure_backoff_strategy_;
