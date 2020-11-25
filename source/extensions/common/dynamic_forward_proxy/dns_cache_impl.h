@@ -57,9 +57,6 @@ public:
   canCreateDnsRequest(ResourceLimitOptRef pending_requests) override;
 
 private:
-  using TlsHostMap = absl::flat_hash_map<std::string, DnsHostInfoSharedPtr>;
-  using TlsHostMapSharedPtr = std::shared_ptr<TlsHostMap>;
-
   struct LoadDnsCacheEntryHandleImpl : public LoadDnsCacheEntryHandle,
                                        RaiiListElement<LoadDnsCacheEntryHandleImpl*> {
     LoadDnsCacheEntryHandleImpl(std::list<LoadDnsCacheEntryHandleImpl*>& parent,
@@ -79,25 +76,37 @@ private:
     DnsCacheImpl& parent_;
   };
 
-  struct DnsHostInfoImpl : public DnsHostInfo {
+  class DnsHostInfoImpl : public DnsHostInfo {
+  public:
     DnsHostInfoImpl(TimeSource& time_source, absl::string_view resolved_host, bool is_ip_address)
         : time_source_(time_source), resolved_host_(resolved_host), is_ip_address_(is_ip_address) {
       touch();
     }
 
+    void setAddress(Network::Address::InstanceConstSharedPtr address) {
+      absl::WriterMutexLock lock{&address_lock_};
+      address_ = address;
+    }
+
     // DnsHostInfo
-    Network::Address::InstanceConstSharedPtr address() override { return address_; }
+    Network::Address::InstanceConstSharedPtr address() const override {
+      absl::ReaderMutexLock lock{&address_lock_};
+      return address_;
+    }
     const std::string& resolvedHost() const override { return resolved_host_; }
     bool isIpAddress() const override { return is_ip_address_; }
     void touch() final { last_used_time_ = time_source_.monotonicTime().time_since_epoch(); }
+    std::chrono::steady_clock::duration lastUsedTime() const { return last_used_time_.load(); }
 
-    absl::Mutex lock_;
+  private:
     TimeSource& time_source_;
     const std::string resolved_host_;
     const bool is_ip_address_;
-    bool first_resolve_complete_ ABSL_GUARDED_BY(lock_){};
-    Network::Address::InstanceConstSharedPtr address_ ABSL_GUARDED_BY(lock_);
-    MonotonicTime last_used_time_ ABSL_GUARDED_BY(lock_);
+    mutable absl::Mutex address_lock_;
+    Network::Address::InstanceConstSharedPtr address_ GUARDED_BY(address_lock_);
+    // Using std::chrono::steady_clock::duration is required for compilation within an atomic vs.
+    // using MonotonicTime.
+    std::atomic<std::chrono::steady_clock::duration> last_used_time_;
   };
 
   using DnsHostInfoImplSharedPtr = std::shared_ptr<DnsHostInfoImpl>;

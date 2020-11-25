@@ -32,7 +32,6 @@ DnsCacheImpl::DnsCacheImpl(
       host_ttl_(PROTOBUF_GET_MS_OR_DEFAULT(config, host_ttl, 300000)),
       max_hosts_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, max_hosts, 1024)) {
   tls_slot_.set([&](Event::Dispatcher&) { return std::make_shared<ThreadLocalHostInfo>(*this); });
-  updateTlsHostsMap();
 }
 
 DnsCacheImpl::~DnsCacheImpl() {
@@ -60,9 +59,9 @@ DnsCacheImpl::loadDnsCacheEntry(absl::string_view host, uint16_t default_port,
   auto [cache_hit, is_overflow] = [&]() {
     // TODO: Consider returning the looked-up host
     absl::ReaderMutexLock read_lock{&primary_hosts_lock_};
-    auto tls_host = primary_hosts_->find(host);
-    bool cache_hit = tls_host != primary_hosts_->end();
-    bool is_overflow = primary_hosts_->size() >= max_hosts_;
+    auto tls_host = primary_hosts_.find(host);
+    bool cache_hit = tls_host != primary_hosts_.end();
+    bool is_overflow = primary_hosts_.size() >= max_hosts_;
     return std::make_tuple(cache_hit, is_overflow);
   }();
 
@@ -105,7 +104,7 @@ absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> DnsCacheImpl::hostMapCopy
   absl::ReaderMutexLock reader_lock{&primary_hosts_lock_};
   for (const auto& host : primary_hosts_) {
     // Only include hosts that have ever resolved to an address.
-    if (host.second->host_info_->address_ != nullptr) {
+    if (host.second->host_info_->address() != nullptr) {
       ret.emplace(host.first, host.second->host_info_);
     }
   }
@@ -117,11 +116,11 @@ absl::optional<const DnsHostInfoSharedPtr> DnsCacheImpl::getHost(absl::string_vi
   const auto host_info = [&]() -> const DnsHostInfoSharedPtr {
     absl::ReaderMutexLock reader_lock{&primary_hosts_lock_};
     auto it = primary_hosts_.find(host_name);
-    return it != primary_hosts_.end() ? it->second->host_info : nullptr;
+    return it != primary_hosts_.end() ? it->second->host_info_ : nullptr;
   }();
 
   // Only include hosts that have ever resolved to an address.
-  if (!host_info || host_info->address_ == nullptr) {
+  if (!host_info || host_info->address() == nullptr) {
     return {};
   } else {
     // Return host info.
@@ -135,17 +134,19 @@ DnsCacheImpl::addUpdateCallbacks(UpdateCallbacks& callbacks) {
 }
 
 void DnsCacheImpl::startCacheLoad(const std::string& host, uint16_t default_port) {
+  ASSERT(main_thread_dispatcher_.isThreadSafe());
   // It's possible for multiple requests to race trying to start a resolution. If a host is
   // already in the map it's either in the process of being resolved or the resolution is already
   // heading out to the worker threads. Either way the pending resolution will be completed.
-  bool in_map = [&]() {
-    absl::ReaderMutexLock reader_lock{&primary_hosts_lock_};
-    return primary_hosts_.find(host) != primary_hosts_.end();
-  }();
 
-  if (in_map) {
-    ENVOY_LOG(debug, "main thread resolve for host '{}' skipped. Entry present", host);
-    return;
+  // TODO(chradcliffe): Here and elsewhere we don't strictly need to hold a lock since we're in the
+  // main thread, but we might trip tooling that checks for locking correctness
+  {
+    absl::ReaderMutexLock reader_lock{&primary_hosts_lock_};
+    if (primary_hosts_.find(host) != primary_hosts_.end()) {
+      ENVOY_LOG(debug, "main thread resolve for host '{}' skipped. Entry present", host);
+      return;
+    }
   }
 
   const auto host_attributes = Http::Utility::parseAuthority(host);
@@ -153,49 +154,53 @@ void DnsCacheImpl::startCacheLoad(const std::string& host, uint16_t default_port
   // TODO(mattklein123): Right now, the same host with different ports will become two
   // independent primary hosts with independent DNS resolutions. I'm not sure how much this will
   // matter, but we could consider collapsing these down and sharing the underlying DNS resolution.
-  absl::WriterMutexLock writer_lock{&primary_hosts_lock_};
-  auto& primary_host = *primary_hosts_
-                            // try_emplace() is used here for direct argument forwarding.
-                            .try_emplace(host, std::make_unique<PrimaryHostInfo>(
-                                                   *this, std::string(host_attributes.host_),
-                                                   host_attributes.port_.value_or(default_port),
-                                                   host_attributes.is_ip_address_,
-                                                   [this, host]() { onReResolve(host); }))
-                            .first->second;
+  auto& primary_host = [&]() -> auto& {
+    absl::WriterMutexLock writer_lock{&primary_hosts_lock_};
+    return *primary_hosts_
+                // try_emplace() is used here for direct argument forwarding.
+                .try_emplace(host, std::make_unique<PrimaryHostInfo>(
+                                       *this, std::string(host_attributes.host_),
+                                       host_attributes.port_.value_or(default_port),
+                                       host_attributes.is_ip_address_,
+                                       [this, host]() { onReResolve(host); }))
+                .first->second;
+  }
+  ();
+
   startResolve(host, primary_host);
 }
 
 void DnsCacheImpl::onReResolve(const std::string& host) {
+  ASSERT(main_thread_dispatcher_.isThreadSafe());
+
   const auto primary_host_it = primary_hosts_.find(host);
   ASSERT(primary_host_it != primary_hosts_.end());
 
   const std::chrono::steady_clock::duration now_duration =
       main_thread_dispatcher_.timeSource().monotonicTime().time_since_epoch();
+  auto last_used_time = primary_host_it->second->host_info_->lastUsedTime();
   ENVOY_LOG(debug, "host='{}' TTL check: now={} last_used={}", primary_host_it->first,
-            now_duration.count(),
-            primary_host_it->second->host_info_->last_used_time_.load().count());
-  if (now_duration - primary_host_it->second->host_info_->last_used_time_.load() > host_ttl_) {
+            now_duration.count(), last_used_time.count());
+  if ((now_duration - last_used_time) > host_ttl_) {
     ENVOY_LOG(debug, "host='{}' TTL expired, removing", host);
     // If the host has no address then that means that the DnsCacheImpl has never
     // runAddUpdateCallbacks for this host, and thus the callback targets are not aware of it.
     // Therefore, runRemoveCallbacks should only be ran if the host's address != nullptr.
-    if (primary_host_it->second->host_info_->address_) {
+    if (primary_host_it->second->host_info_->address()) {
       runRemoveCallbacks(host);
     }
     primary_hosts_.erase(primary_host_it);
-    updateTlsHostsMap();
   } else {
     startResolve(host, *primary_host_it->second);
   }
 }
 
 void DnsCacheImpl::startResolve(const std::string& host, PrimaryHostInfo& host_info) {
-  absl::ReaderMutexLock reader_lock{host_info.lock_};
+  stats_.dns_query_attempt_.inc();
   ENVOY_LOG(debug, "starting main thread resolve for host='{}' dns='{}' port='{}'", host,
             host_info.host_info_->resolved_host_, host_info.port_);
   ASSERT(host_info.active_query_ == nullptr);
 
-  stats_.dns_query_attempt_.inc();
   host_info.active_query_ =
       resolver_->resolve(host_info.host_info_->resolved_host_, dns_lookup_family_,
                          [this, host](Network::DnsResolver::ResolutionStatus status,
@@ -207,14 +212,13 @@ void DnsCacheImpl::startResolve(const std::string& host, PrimaryHostInfo& host_i
 void DnsCacheImpl::finishResolve(const std::string& host,
                                  Network::DnsResolver::ResolutionStatus status,
                                  std::list<Network::DnsResponse>&& response) {
+  ASSERT(main_thread_dispatcher_.isThreadSafe());
   ENVOY_LOG(debug, "main thread resolve complete for host '{}'. {} results", host, response.size());
   const auto primary_host_it = primary_hosts_.find(host);
   ASSERT(primary_host_it != primary_hosts_.end());
 
   auto& primary_host_info = *primary_host_it->second;
   primary_host_info.active_query_ = nullptr;
-  const bool first_resolve = !primary_host_info.host_info_->first_resolve_complete_;
-  primary_host_info.host_info_->first_resolve_complete_ = true;
 
   // If the DNS resolver successfully resolved with an empty response list, the dns cache does not
   // update. This ensures that a potentially previously resolved address does not stabilize back to
@@ -237,18 +241,12 @@ void DnsCacheImpl::finishResolve(const std::string& host,
   //
   // This means that once a host gets an address it will stick even in the case of a subsequent
   // resolution failure.
-  bool address_changed = false;
-  if (new_address != nullptr && (primary_host_info.host_info_->address_ == nullptr ||
-                                 *primary_host_info.host_info_->address_ != *new_address)) {
+  auto current_address = primary_host_info.host_info_->address();
+  if (new_address != nullptr && (current_address == nullptr || *current_address != *new_address)) {
     ENVOY_LOG(debug, "host '{}' address has changed", host);
-    primary_host_info.host_info_->address_ = new_address;
+    primary_host_info.host_info_->setAddress(new_address);
     runAddUpdateCallbacks(host, primary_host_info.host_info_);
-    address_changed = true;
     stats_.host_address_changed_.inc();
-  }
-
-  if (first_resolve || address_changed) {
-    updateTlsHostsMap();
   }
 
   // Kick off the refresh timer.
@@ -269,13 +267,13 @@ void DnsCacheImpl::finishResolve(const std::string& host,
 
 void DnsCacheImpl::runAddUpdateCallbacks(const std::string& host,
                                          const DnsHostInfoSharedPtr& host_info) {
-  for (auto callbacks : update_callbacks_) {
+  for (auto* callbacks : update_callbacks_) {
     callbacks->callbacks_.onDnsHostAddOrUpdate(host, host_info);
   }
 }
 
 void DnsCacheImpl::runRemoveCallbacks(const std::string& host) {
-  for (auto callbacks : update_callbacks_) {
+  for (auto* callbacks : update_callbacks_) {
     callbacks->callbacks_.onDnsHostRemove(host);
   }
 }
@@ -294,13 +292,12 @@ DnsCacheImpl::ThreadLocalHostInfo::~ThreadLocalHostInfo() {
 }
 
 void DnsCacheImpl::ThreadLocalHostInfo::onHostMapUpdate() {
-  host_map_ = new_host_map;
   for (auto pending_resolution_it = pending_resolutions_.begin();
        pending_resolution_it != pending_resolutions_.end();) {
     auto& pending_resolution = **pending_resolution_it;
     bool has_host = [&]() {
       absl::ReaderMutexLock reader_lock{&parent_.primary_hosts_lock_};
-      return parent_.primary_hosts_->count(pending_resolution.host_) != 0;
+      return parent_.primary_hosts_.count(pending_resolution.host_) != 0;
     }();
     if (has_host) {
       auto& callbacks = pending_resolution.callbacks_;
